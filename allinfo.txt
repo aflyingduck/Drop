@@ -1,0 +1,496 @@
+#@INCLUDE=util/PythonInvoker.ps1
+#@START_INCLUDES_HERE
+#------------ INCLUDES START - Do not edit between this line and INCLUDE ENDS -----
+#- Begin file: util/PythonInvoker.ps1
+$fso = New-Object -ComObject "Scripting.FileSystemObject"
+$taniumClientDir = $env:TANIUM_CLIENT_ROOT
+$python = "$taniumClientDir\TPython\TPython.bat"
+
+Function InvokePython($pythonScriptContents) {
+    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $processInfo.FileName = $python
+    $processInfo.Arguments = "-"
+    $processInfo.RedirectStandardInput = $true
+    $processInfo.RedirectStandardOutput = $true
+    $processInfo.RedirectStandardError = $false
+    $processInfo.UseShellExecute = $false
+    $processInfo.EnvironmentVariables.Add("TANIUM_SENSOR", "1")
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $processInfo
+    $process.Start() | Out-Null
+
+    $process.StandardInput.Write($pythonScriptContents)
+    $process.StandardInput.Close()
+
+    $pythonOutput = $process.StandardOutput.ReadToEnd()
+
+    $process.WaitForExit()
+
+    Write-Output "$pythonOutput"
+}
+#- End file: util/PythonInvoker.ps1
+#------------ INCLUDES END - Do not edit above this line and INCLUDE STARTS -----
+
+$pythonScript = @'
+from __future__ import unicode_literals
+
+# Get-TaniumClientPatchCandidatesLocal
+# Output columns: Type|Title|Install Status|Patchlist IDs|Blocked|Scheduled|Version|Vendor|Deployments
+
+import os
+import sys
+import sqlite3
+import subprocess
+
+try:
+    import tanium.client
+    _HAS_TANIUM = True
+except Exception:
+    tanium = None
+    _HAS_TANIUM = False
+
+# ------------------------
+# Configured filters (sensor defaults)
+# ------------------------
+ONLY_NOT_INSTALLED = True    # keep filtering for not installed
+EXCLUDE_SUPERSEDED = False   # include superseded
+ONLY_IN_PATCHLIST = False    # no restriction by patchlist
+EXCLUDE_BLOCKLISTED = False  # keep blocked patches unless explicitly excluded
+RESPECT_OVERRIDE_FOR_BLOCKED = False  # if True, override clears Blocked; False shows raw blocklist
+
+# Honor env overrides for boolean flags (optional)
+def _env_truthy(name):
+    return os.environ.get(name, '').lower() in ('1','true','yes')
+
+EXCLUDE_BLOCKLISTED = EXCLUDE_BLOCKLISTED or _env_truthy('TANIUM_EXCLUDE_BLOCKLISTED')
+# Allow env to force respecting overrides if needed
+if os.environ.get('TANIUM_BLOCKED_RESPECT_OVERRIDE','').lower() in ('1','true','yes'):
+    RESPECT_OVERRIDE_FOR_BLOCKED = True
+
+# ------------------------
+# Path helpers
+# ------------------------
+
+def _get_client_dir():
+    if _HAS_TANIUM:
+        try:
+            return tanium.client.get_client_dir()
+        except Exception:
+            pass
+    env = os.environ.get('TANIUM_CLIENT_ROOT')
+    if env and os.path.isdir(env):
+        return env
+    default = r'C:\\Program Files (x86)\\Tanium\\Tanium Client'
+    return default if os.path.isdir(default) else None
+
+
+def get_patch_db_path():
+    # Always use the patch.db from extensions\patch\data
+    db_path = r'C:\Program Files (x86)\Tanium\Tanium Client\extensions\patch\data\patch.db'
+    if os.path.isfile(db_path):
+        return db_path
+    return None
+
+
+def get_sm_db_path():
+    client_dir = _get_client_dir()
+    if client_dir:
+        live = os.path.join(client_dir, 'Tools', 'SoftwareManagement', 'data', 'software-management.db')
+        if os.path.isfile(live):
+            return live
+    return None
+
+# ------------------------
+# Query helpers
+# ------------------------
+
+def fetch_candidates(cur):
+    where = []
+    if ONLY_NOT_INSTALLED:
+        where.append('v.installed = 0')
+    if ONLY_IN_PATCHLIST:
+        where.append('(COALESCE(v.in_patchlist,0) = 1)')
+    if EXCLUDE_SUPERSEDED:
+        where.append('(COALESCE(p.superseded,0) = 0)')
+    if EXCLUDE_BLOCKLISTED:
+        # Exclude if in blocklist AND not explicitly overridden by a patchlist rule
+        where.append("NOT (EXISTS (SELECT 1 FROM Patch_BlocklistRule b WHERE b.tanium_uid = v.tanium_uid) AND NOT EXISTS (SELECT 1 FROM Patch_PatchlistRule r WHERE r.tanium_uid = v.tanium_uid AND COALESCE(r.override_blocklist,0)=1))")
+    where_sql = (' WHERE ' + ' AND '.join(where)) if where else ''
+
+    blocked_expr = (
+        "CASE WHEN (COALESCE(v.in_blocklist,0)=1) OR "
+        "(EXISTS (SELECT 1 FROM Patch_BlocklistRule b WHERE b.tanium_uid = v.tanium_uid) "
+        "AND NOT EXISTS (SELECT 1 FROM Patch_PatchlistRule r WHERE r.tanium_uid = v.tanium_uid AND COALESCE(r.override_blocklist,0)=1)) "
+        "THEN 1 ELSE 0 END"
+    )
+
+    # Include override, local blocklist, and patchlist rule counts for final decision in Python
+    select_core = (
+        'SELECT v.tanium_uid, v.title, v.installed, '
+        "COALESCE(v.patchlist_ids,'') , COALESCE(v.in_patchlist,0), "
+        '(SELECT COUNT(1) FROM Patch_PatchlistRule r WHERE r.tanium_uid = v.tanium_uid AND COALESCE(r.override_blocklist,0)=1) AS override_cnt, '
+        '(SELECT COUNT(1) FROM Patch_BlocklistRule b WHERE b.tanium_uid = v.tanium_uid) AS blocklist_cnt, '
+        '(SELECT COUNT(1) FROM Patch_PatchlistRule r2 WHERE r2.tanium_uid = v.tanium_uid) AS in_rule_cnt '
+    )
+    if EXCLUDE_SUPERSEDED:
+        sql = select_core + 'FROM v_PatchCandidate v JOIN Patch p ON p.tanium_uid = v.tanium_uid' + where_sql
+    else:
+        sql = select_core + 'FROM v_PatchCandidate v' + where_sql
+    cur.execute(sql)
+    return cur.fetchall()
+
+
+def get_deployed_patch_uids(patch_cur):
+    # Cross-reference DeploymentPatchLists (patchlist_id) with Patch_PatchlistRule (tanium_uid)
+    # to get UIDs of patches that are actively deployed
+    try:
+        patch_cur.execute("""
+            SELECT DISTINCT pr.tanium_uid
+            FROM DeploymentPatchLists dpl
+            JOIN Patch_PatchlistRule pr ON pr.patchlist_id = dpl.patchlist_id
+        """)
+        return set([row[0] for row in patch_cur.fetchall()])
+    except Exception:
+        return set()
+
+
+def get_patch_deployment_map(patch_cur):
+    """Return mapping of patch tanium_uid -> set of service_id strings from DeploymentPatchLists"""
+    mapping = {}
+    try:
+        patch_cur.execute(
+            """
+            SELECT DISTINCT dpl.service_id, pr.tanium_uid
+            FROM DeploymentPatchLists dpl
+            JOIN Patch_PatchlistRule pr ON pr.patchlist_id = dpl.patchlist_id
+            WHERE dpl.service_id IS NOT NULL
+            """
+        )
+        rows = patch_cur.fetchall()
+        for service_id, tanium_uid in rows:
+            if service_id is None:
+                continue
+            mapping.setdefault(tanium_uid, set()).add(str(service_id))
+    except Exception:
+        pass
+    return mapping
+
+def get_patch_deployment_info(patch_cur, service_ids):
+    """Resolve service_id -> (name, status, error_string) using DeploymentStatus table in patch.db"""
+    # Status code mapping for patch deployment status
+    status_map = {
+        '2': 'Complete - All patches applied',
+        '5': 'Download complete - waiting maintenance window',
+        '12': 'Not Applicable'
+    }
+    info = {}
+    if not service_ids:
+        return info
+    try:
+        placeholders = ','.join(['?'] * len(service_ids))
+        patch_cur.execute(
+            f"SELECT service_id, COALESCE(name,''), COALESCE(status,''), COALESCE(error_string,'') FROM DeploymentStatus WHERE service_id IN ({placeholders})",
+            list(service_ids),
+        )
+        for sid, name, status, error_string in patch_cur.fetchall():
+            status_str = str(status or '')
+            # Convert numeric status code to human-readable text if known
+            status_display = status_map.get(status_str, status_str)
+            info[str(sid)] = (str(name or ''), status_display, str(error_string or ''))
+    except Exception:
+        pass
+    return info
+
+
+def has_active_deployments():
+    # Check Software Management DB for active deployments
+    db = get_sm_db_path()
+    if not db or not os.path.isfile(db):
+        return False
+    try:
+        conn = sqlite3.connect('file:{}?mode=ro'.format(db), uri=True)
+        cur = conn.cursor()
+        cur.execute('SELECT COUNT(1) FROM deployments WHERE COALESCE(is_active,0)=1')
+        cnt = (cur.fetchone() or (0,))[0]
+        conn.close()
+        return cnt > 0
+    except Exception:
+        return False
+
+
+def has_maintenance_windows():
+    db = get_sm_db_path()
+    if not db or not os.path.isfile(db):
+        return False
+    try:
+        conn = sqlite3.connect('file:{}?mode=ro'.format(db), uri=True)
+        cur = conn.cursor()
+        cur.execute('SELECT COUNT(1) FROM maintenance_windows')
+        cnt = (cur.fetchone() or (0,))[0]
+        conn.close()
+        return cnt > 0
+    except Exception:
+        return False
+
+
+def version_sort_key(version_string):
+    """Convert version string to sortable format for comparison"""
+    if not version_string:
+        return "0000000000" * 10
+    parts = version_string.split('.')
+    padded_parts = []
+    for i in range(10):
+        if i < len(parts):
+            try:
+                padded_parts.append(str(int(parts[i])).zfill(10))
+            except (ValueError, TypeError):
+                padded_parts.append("0000000000")
+        else:
+            padded_parts.append("0000000000")
+    return '.'.join(padded_parts)
+
+
+def get_scheduled_software_ids(sm_cur):
+    """Return set of software_package_id values that have an active/running deployment"""
+    try:
+        sm_cur.execute(
+            """
+            SELECT DISTINCT CAST(json_extract(yt.options, '$.software_package_id') AS TEXT) AS spid
+            FROM tasks yt
+            JOIN deployments dp ON dp.id = yt.job_id
+            WHERE yt.job_type = 'Deployment'
+              AND (
+                    COALESCE(dp.is_active,0) = 1 OR
+                    dp.persistent_status IN ('Downloading','Running','Waiting','Queued','Preparing','Prepared')
+                  )
+            """
+        )
+        return set([row[0] for row in sm_cur.fetchall() if row and row[0] is not None])
+    except Exception:
+        return set()
+
+
+def get_software_deployment_map(sm_cur):
+    """Return mapping of software_package_id (TEXT) -> list of (deployment_id, deployment_name, status_type, status_params) for active/in-progress deployments"""
+    result = {}
+    try:
+        sm_cur.execute(
+            """
+            SELECT DISTINCT
+                CAST(json_extract(yt.options, '$.software_package_id') AS TEXT) AS spid,
+                dp.id,
+                COALESCE(dp.name, ''),
+                COALESCE(dp.status_type, ''),
+                COALESCE(dp.status_params, '')
+            FROM tasks yt
+            JOIN deployments dp ON dp.id = yt.job_id
+            WHERE yt.job_type = 'Deployment'
+              AND (
+                    COALESCE(dp.is_active,0) = 1 OR
+                    dp.persistent_status IN ('Downloading','Running','Waiting','Queued','Preparing','Prepared')
+                  )
+            """
+        )
+        for spid, dep_id, dep_name, status_type, status_params in sm_cur.fetchall():
+            if spid is None:
+                continue
+            key = str(spid)
+            result.setdefault(key, []).append((str(dep_id), str(dep_name or ''), str(status_type or ''), str(status_params or '')))
+    except Exception:
+        pass
+    return result
+
+
+def get_deployment_names(sm_cur, ids):
+    """Resolve deployment ids to names from deployments table. ids: iterable of string ids"""
+    names = {}
+    if not ids:
+        return names
+    try:
+        placeholders = ','.join(['?'] * len(ids))
+        sm_cur.execute(f"SELECT id, COALESCE(name,'') FROM deployments WHERE id IN ({placeholders})", list(ids))
+        for dep_id, name in sm_cur.fetchall():
+            names[str(dep_id)] = str(name or '')
+    except Exception:
+        pass
+    return names
+
+
+def fetch_deploy_software(sm_cur):
+    """Fetch scheduled and latest unscheduled Deploy software packages; scheduling computed in Python"""
+    try:
+        sm_cur.connection.create_function('version_sort_key', 1, version_sort_key)
+        query = """
+            WITH version_ranked AS (
+                SELECT
+                    sp.id,
+                    sp.software_package_id,
+                    sp.product_vendor,
+                    sp.product_name,
+                    sp.product_version,
+                    version_sort_key(sp.product_version) AS version_key,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY sp.product_vendor, sp.product_name
+                        ORDER BY version_sort_key(sp.product_version) DESC, sp.created_at DESC
+                    ) as row_num
+                FROM software_packages sp
+                WHERE sp.product = 'Deploy'
+                    AND sp.applicability IN ('Update Eligible')
+            )
+            SELECT
+                sp.id,
+                sp.software_package_id,
+                sp.product_name AS title,
+                sp.applicability AS install_status,
+                sp.product_version AS version,
+                sp.product_vendor AS vendor
+            FROM software_packages sp
+            WHERE sp.product = 'Deploy'
+              AND sp.applicability IN ('Update Eligible')
+              AND (
+                    EXISTS (
+                        SELECT 1
+                        FROM tasks yt
+                        JOIN deployments dp ON dp.ID = yt.job_id
+                        WHERE yt.job_type = 'Deployment'
+                          AND json_extract(yt.options, '$.software_package_id') = sp.software_package_id
+                          AND (
+                                COALESCE(dp.is_active,0) = 1 OR
+                                dp.persistent_status IN ('Downloading','Running','Waiting','Queued','Preparing','Prepared')
+                              )
+                    )
+                    OR sp.id IN (SELECT id FROM version_ranked WHERE row_num = 1)
+              )
+        """
+        sm_cur.execute(query)
+        return sm_cur.fetchall()
+    except Exception:
+        return []
+
+# ------------------------
+# Main sensor
+# ------------------------
+
+def sensor_main():
+    patch_db = get_patch_db_path()
+    if not patch_db:
+        return 'TSE-Error: Patch database not found'
+
+    try:
+        conn = sqlite3.connect('file:{}?mode=ro'.format(patch_db), uri=True)
+        cur = conn.cursor()
+        rows = fetch_candidates(cur)
+        deployed_uids = get_deployed_patch_uids(cur)
+        patch_dep_map = get_patch_deployment_map(cur)
+        # Build lookup of patch deployment service_id -> (name, status, error_string) from DeploymentStatus
+        patch_service_ids = set()
+        for dep_set in patch_dep_map.values():
+            patch_service_ids.update(dep_set)
+        patch_dep_info_lookup = get_patch_deployment_info(cur, patch_service_ids)
+        conn.close()
+
+        has_active_deps = has_active_deployments()
+        mw_present = has_maintenance_windows()
+
+    # Fetch Deploy software packages
+        sm_db = get_sm_db_path()
+        deploy_rows = []
+        scheduled_ids = set()
+        software_dep_map = {}
+        if sm_db and os.path.isfile(sm_db):
+            try:
+                sm_conn = sqlite3.connect('file:{}?mode=ro'.format(sm_db), uri=True)
+                sm_cur = sm_conn.cursor()
+                # Find scheduled software package IDs and fetch rows
+                scheduled_ids = get_scheduled_software_ids(sm_cur)
+                software_dep_map = get_software_deployment_map(sm_cur)
+                deploy_rows = fetch_deploy_software(sm_cur)
+                sm_conn.close()
+            except Exception:
+                pass
+
+        if not rows and not deploy_rows:
+            return 'All applicable patches applied'
+
+        out_lines = []
+        
+        # Output patches
+        for row in rows:
+            # rows: uid, title, installed, patchlist_ids, in_patchlist, override_cnt, blocklist_cnt, in_rule_cnt
+            uid, title, installed, patchlist_ids, in_patchlist, override_cnt, blocklist_cnt, in_rule_cnt = row
+            install_status = 'Not Installed' if installed == 0 else 'Installed'
+            # Decide Blocked from local DB
+            is_blocked = (blocklist_cnt or 0) > 0
+            # Optionally let overrides clear Blocked
+            if RESPECT_OVERRIDE_FOR_BLOCKED and (override_cnt or 0) > 0:
+                is_blocked = False
+            blocked = 'Yes' if is_blocked else 'No'
+            # Scheduled: patch UID must be in a deployed patchlist AND active deployments exist AND maintenance windows exist
+            is_deployed = (uid in deployed_uids)
+            scheduled = 'Scheduled' if (is_deployed and has_active_deps and mw_present) else 'Unscheduled'
+            deployments_col = ''
+            if scheduled == 'Scheduled':
+                sids_for_patch = sorted(list(patch_dep_map.get(uid, [])))
+                if sids_for_patch:
+                    pairs = []
+                    for sid in sids_for_patch:
+                        name, status, error_string = patch_dep_info_lookup.get(sid, ('', '', ''))
+                        if name or status or error_string:
+                            pairs.append(f"{sid}:{name}|{status}|{error_string}")
+                        else:
+                            pairs.append(f"{sid}")
+                    deployments_col = ';'.join(pairs)
+            out_lines.append('|'.join([
+                'Patch',
+                str(title or ''),
+                install_status,
+                str(patchlist_ids or ''),
+                blocked,
+                scheduled,
+                '',  # version (empty for patches)
+                '',  # vendor (empty for patches)
+                deployments_col
+            ]))
+        
+        # Output Deploy software packages
+        for row in deploy_rows:
+            # rows: id, software_package_id, title, install_status, version, vendor
+            _, spid, title, install_status, version, vendor = row
+            scheduled = 'Scheduled' if str(spid) in scheduled_ids else 'Unscheduled'
+            deployments_col = ''
+            if scheduled == 'Scheduled':
+                entries = software_dep_map.get(str(spid), [])
+                if entries:
+                    deployments_col = ';'.join([f"{did}:{dname}|{status_type}|{status_params}" for did, dname, status_type, status_params in entries])
+            out_lines.append('|'.join([
+                'Software',
+                str(title or ''),
+                str(install_status or ''),
+                '',  # patchlist_ids (empty for software)
+                '',  # blocked (empty for software)
+                str(scheduled or ''),
+                str(version or ''),
+                str(vendor or ''),
+                deployments_col
+            ]))
+
+        return '\n'.join(out_lines)
+
+    except Exception as e:
+        return 'TSE-Error: {}'.format(str(e))
+
+
+if __name__ == '__main__':
+    try:
+        if _HAS_TANIUM and hasattr(tanium, 'results'):
+            tanium.results.add(sensor_main())
+        else:
+            sys.stdout.write(sensor_main())
+    except Exception:
+        sys.stdout.write(sensor_main())
+'@
+
+# Always run Python for authoritative Blocked; preprocessed may lack blocklist truth
+InvokePython $pythonScript
+# Copyright 2025, Tanium Inc.
